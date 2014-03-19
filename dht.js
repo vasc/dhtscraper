@@ -1,15 +1,16 @@
+/*jslint node: true */
 'use strict';
 
 var dgram = require('dgram'),
+    fs = require('fs'),
     bencode = require('bencode'),
     crypto = require('crypto'),
-    util = require('util'),
     bigint = require('bigint'),
     when = require('when'),
     _ = require('lodash'),
     xor = require('xor'),
-    timeout = require('when/timeout'),
-    events = require('events');
+    util = require('util'),
+    timeout = require('when/timeout');
 
 var PORT = 6881;
 var HOST = 'router.bittorrent.com';
@@ -19,26 +20,33 @@ function DHT(){
   var self = this;
   var dht = {};
   var querys = {};
-  var emmiters = {}
 
   //public
   this.id = crypto.pseudoRandomBytes(20);
 
   this.bootstrap = function(host, port){
     return lookup(crypto.pseudoRandomBytes(20), {ip: host, port: port});
-  }
+  };
 
   this.findPeers = function(infoHash){
 
-    var nodes = getClosest(infoHash, 8);
+    var nodes = getClosest(infoHash, 1);
     //console.error(nodes);
     if(nodes.length === 0) {
-      console.error('OVER!');
+      console.error('Empty DHT for', infoHash);
+      setTimeout(function(){
+        self.findPeers(infoHash);
+      }, 10000);
       return;
     }
     var lookups = _.map(nodes, function(node){
       node.queried[infoHash] = true;
-      return timeout(1000, lookup(infoHash, node));
+      var tid = crypto.pseudoRandomBytes(4);
+      var promise = timeout(30000, lookup(infoHash, node, tid))
+      promise.finally(function(){
+        delete querys[tid.readUInt32BE(0)];
+      })
+      return promise;
     });
 
     when.any(lookups).then(function(){
@@ -48,32 +56,33 @@ function DHT(){
       console.error('ALL Failed');
       self.findPeers(infoHash);
     });
-
-    //emmiters[infoHash] = new events.EventEmmiter;
-    return emmiters[infoHash];
   };
   
   //private
   var addNode = function(id, ip, port){
     if(!dht[id])
       dht[id] = {
-        id: id, 
-        ip: ip, 
+        id: id,
+        ip: ip,
         port: port,
-        queried: {}
+        queried: {},
+        failures: 0
       };
   };
 
   var getClosest = function(infoHash, maxNum){
+    console.error('DHT size:', _.values(dht).length);
+    console.error('DHT usable:', _(dht).values().reject(function(node){return node.failures>=3;}).value().length);
     return _(dht)
       .values()
       //.each(function(node){console.log(node);})
       .reject(function(node){ return node.queried[infoHash];})
-      .map(function(node){ 
+      .reject(function(node){ return node.failures >= 3;})
+      .map(function(node){
         return {
           node: node,
           distance: bigint.fromBuffer(xor(node.id, infoHash))
-        }
+        };
       })
       .sort(function(a, b) {
         if (a.distance.lt(b.distance)) return -1;
@@ -88,39 +97,43 @@ function DHT(){
 
   var buildFindNodeQuery = function(infoHash, tid){
     return bencode.encode({
-      t: tid, 
-      y: new Buffer('q'), 
-      q: new Buffer('find_node'), 
+      t: tid,
+      y: new Buffer('q'),
+      q: new Buffer('find_node'),
       a: {
-        id: self.id, 
+        id: self.id,
         target: infoHash
       }
     });
-  }
+  };
 
   var buildGetPeersQuery = function(infoHash, tid){
     return bencode.encode({
-      t: tid, 
-      y: new Buffer('q'), 
-      q: new Buffer('get_peers'), 
+      t: tid,
+      y: new Buffer('q'),
+      q: new Buffer('get_peers'),
       a: {
-        id: self.id, 
+        id: self.id,
         info_hash: infoHash
       }
     });
-  }
+  };
   
-  var lookup = function(infoHash, node){
-    console.error("lookup %s from %s:%d", infoHash.toString('hex'), node.ip, node.port)
+  var lookup = function(infoHash, node, tid){
+    //console.error('lookup %s from %s:%d', infoHash.toString('hex'), node.ip, node.port);
+    if(!tid) tid = crypto.pseudoRandomBytes(4);
+
     var deferred = when.defer();
-    var tid = crypto.pseudoRandomBytes(4);
     var buf = buildGetPeersQuery(infoHash, tid);
-    client.send(buf, 0, buf.length, node.port, node.ip, function(err, bytes) {
-      if (err) deferred.reject(err);
+    node.failures++;
+    client.send(buf, 0, buf.length, node.port, node.ip, function(err/*, bytes*/) {
+      if (err) return deferred.reject(err);
       querys[tid.readUInt32BE(0)] = {
         deferred: deferred,
-        infoHash: infoHash
+        infoHash: infoHash,
+        node: node
       };
+      console.error('Query Buffer:', _.values(querys).length);
       //console.error('UDP message sent to ' + node.ip +':'+ node.port);
     });
     return deferred.promise;
@@ -131,18 +144,28 @@ function DHT(){
   client.on('message', function(messageBuffer, remote) {
     console.error('Message from %s:%d', remote.address, remote.port);
 
-    var message = bencode.decode(messageBuffer);
+    try{
+      var message = bencode.decode(messageBuffer);
+    }
+    catch (e){
+      console.error('Response poorly formated');
+      return;
+    }
 
     if(!message.t || message.t.length !== 4)
       return;
 
+    if(!querys[message.t.readUInt32BE(0)])
+      return console.error('Message took too long:', message.t.toString('hex'));
+
     if(!message.r){
       //querys[message.t.readUInt32BE(0)].reject(new Error('Query contained no response'));
-      console.error('Query contained no response');
+      if(message.e) console.error('Error', message.e[1].toString());
+      else console.error('Query contained no response');
       return;
     }
     //console.log(util.inspect(message));
-    var infoHash = querys[message.t.readUInt32BE(0)].infoHash.toString('hex')
+    var infoHash = querys[message.t.readUInt32BE(0)].infoHash.toString('hex');
 
     var values = message.r.values;
     if(values){
@@ -151,14 +174,19 @@ function DHT(){
           var ip = peer.readUInt32BE(0);
           var port = peer.readUInt16BE(4);
           
-          console.log("%s,%s", infoHash, num2dot(ip));
+          console.log('%s,%s:%d', infoHash, num2dot(ip), port);
         }
-      })
+      });
+      querys[message.t.readUInt32BE(0)].node.failures--;
+      querys[message.t.readUInt32BE(0)].deferred.resolve();
+      //delete querys[message.t.readUInt32BE(0)];
+      return;
     }
 
     var nodes = message.r.nodes;
     if(!nodes){
       querys[message.t.readUInt32BE(0)].deferred.reject(new Error('No nodes value'));
+      //delete querys[message.t.readUInt32BE(0)];
       return;
     }
 
@@ -170,12 +198,14 @@ function DHT(){
       addNode(id, num2dot(ip), port);
     }
 
+    querys[message.t.readUInt32BE(0)].node.failures--;
     querys[message.t.readUInt32BE(0)].deferred.resolve();
+    //delete querys[message.t.readUInt32BE(0)];
   });
 }
 
-var hashes = [
-  new Buffer('4B642D022980E5EBAA7CF4B6E1CC93769921CB42', 'hex'),
+/*var hashes = [
+  new Buffer( '4B642D022980E5EBAA7CF4B6E1CC93769921CB42', 'hex'),
   new Buffer('65548EDADF2AD10F73DB8DFA002A80EFD2A1AB45', 'hex'),
   new Buffer('CE9FBDAA734CFBC160E8EF9D29072646C09958DD', 'hex'),
   new Buffer('4956A4E976EA948025C3C3554567CA2820F65F64', 'hex'),
@@ -184,22 +214,26 @@ var hashes = [
   new Buffer('80B0F2788FD33CBB6272049EDFE3911F6AEAE5AC', 'hex'),
   new Buffer('10AB9CAD41F545893AF00993CBFA168FABD46395', 'hex'),
   new Buffer('3535A1A6375A619507141C7975611740455E1954', 'hex'),
-];
+];*/
+
+var jsonFile = fs.readFileSync(process.argv[2]);
+var movieInfo = JSON.parse(jsonFile);
+
+var hashes = _.map(_.pluck(movieInfo, 'hash'), function(hex){ return new Buffer(hex, 'hex')});
 
 var dht = new DHT();
 dht.bootstrap(HOST, PORT).done(function(){
   _.each(hashes, function(info_hash){
     dht.findPeers(info_hash);
   });
-})
+});
 
-function num2dot(num) 
-{
-    var d = num%256;
-    for (var i = 3; i > 0; i--) 
-    { 
-        num = Math.floor(num/256);
-        d = num%256 + '.' + d;
-    }
-    return d;
+function num2dot(num){
+  var d = num%256;
+  for (var i = 3; i > 0; i--){
+    num = Math.floor(num/256);
+    d = num%256 + '.' + d;
+  }
+  return d;
 }
+
