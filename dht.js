@@ -1,6 +1,11 @@
 /*jslint node: true */
 'use strict';
 
+require('nodetime').profile({
+    accountKey: '90f7467fafd88d68dea0cc20e3abe9818aaa2eb0', 
+    appName: 'DHT.js'
+  });
+
 var dgram = require('dgram'),
     fs = require('fs'),
     bencode = require('bencode'),
@@ -10,89 +15,251 @@ var dgram = require('dgram'),
     _ = require('lodash'),
     xor = require('xor'),
     util = require('util'),
-    timeout = require('when/timeout');
+    timeout = require('when/timeout'),
+    readline = require('readline'),
+    yargs = require('yargs');
 
 var PORT = 6881;
 var HOST = 'router.bittorrent.com';
 
 
-function DHT(){
+function DHT(outputFile){
+  var outputStream = fs.createWriteStream(outputFile);
   var self = this;
   var dht = {};
+  var dhtArray = [];
   var querys = {};
+
+  var infoHashes = [];
+  var infoHashesInt = {};
+  var backlog = {};
 
   //public
   this.id = crypto.pseudoRandomBytes(20);
 
   this.bootstrap = function(host, port){
-    return lookup(crypto.pseudoRandomBytes(20), {ip: host, port: port});
+    return timeout(1000, lookup(crypto.pseudoRandomBytes(20), {ip: host, port: port}));
   };
 
-  this.findPeers = function(infoHash){
+  var hashesPositionCounter = 0;
+  this.findPeers2 = function(){
+    hashesPositionCounter++;
+    hashesPositionCounter %= infoHashes.length;
 
-    var nodes = getClosest(infoHash, 1);
-    //console.error(nodes);
-    if(nodes.length === 0) {
-      console.error('Empty DHT for', infoHash);
-      setTimeout(function(){
-        self.findPeers(infoHash);
-      }, 10000);
-      return;
+    var infoHash = infoHashes[hashesPositionCounter];
+    var bi = backlog[infoHash];
+    
+    var node = getClosest2(infoHash);
+
+    if(!node){
+      log(util.format('%s empty DHT, swapping', infoHash.toString('hex')));
+      swapHash(bi)
+      return self.findPeers2();;
     }
-    var lookups = _.map(nodes, function(node){
-      node.queried[infoHash] = true;
-      var tid = crypto.pseudoRandomBytes(4);
-      var promise = timeout(30000, lookup(infoHash, node, tid))
-      promise.finally(function(){
-        delete querys[tid.readUInt32BE(0)];
-      })
-      return promise;
+
+    bi.outstanding++;
+    var tid = crypto.pseudoRandomBytes(4);
+    var lookupPromise = lookup(infoHash, node, tid);
+    var timeoutPromise = timeout(1000, lookupPromise);
+
+    lookupPromise.done(function(result){
+
+      if(result.nodes){
+        for(var i = 0; i < result.nodes.length; i++){
+          var node = result.nodes[i];
+          addPrivateNode(bi, node.id, node.ip, node.port);
+        }
+      }
+
+      if(result.datapoints){
+        var newDatapoints = _.difference(result.datapoints, bi.datapoints);
+        bi.datapoints = bi.datapoints.concat(newDatapoints);
+
+        if(newDatapoints.length > 0){
+          bi.outstanding = 0;
+          outputStream.write(newDatapoints.join('\n')+'\n');
+        }
+
+      }
+    }, function(e){
+      log(e);
     });
 
-    when.any(lookups).then(function(){
-      console.error('SOME Worked');
-      self.findPeers(infoHash);
+    /*timeoutPromise.then(function(){
+      //console.error('Lookup succeeded: %s:%d', node.ip, node.port);
     }, function(){
-      console.error('ALL Failed');
-      self.findPeers(infoHash);
+      console.error('%s lookup failed', infoHash.toString('hex'));
+    });*/
+
+    timeoutPromise.finally(function(){        
+      if(bi.outstanding > 512 && bi.inDHT){//bi.datapoints >= bi.datapointEstimate){
+        swapHash(bi);
+      }
+      self.findPeers2();
     });
   };
+
+  this.addHashes = function(backlogItems){
+    log('Preparing Hashs');
+    _.each(backlogItems, function(backlogItem){
+      backlogItem.datapoints = [];
+      backlog[backlogItem.hash] = backlogItem;
+      backlogItem.inDHT = false;
+      backlogItem.outstanding = 0;
+      backlogItem.totalOutstanding = 0;
+      backlogItem.dht = {};
+      backlogItem.dhtArray = [];
+
+      _.each(dhtArray, function(node){
+        addPrivateNode(backlogItem, node.id, node.ip, node.port);
+      });
+    });
+
+    _(backlog)
+      .values()
+      .reject('inDHT')
+      .sortBy(function(bi){ bi.datapointEstimate - bi.datapoints.length})
+      .slice(0, 10-infoHashes.length)
+      .each(function(bi){
+        bi.inDHT = true;
+        infoHashes.push(bi.hash);
+        infoHashesInt[bi.hash] = bigint.fromBuffer(bi.hash);
+      });
+  }
   
+  var swapHash = function(bi){
+    var nbi = _(backlog)
+      .values()
+      .reject('inDHT')
+      .sortBy('totalOutstanding')
+      .first();
+          
+    infoHashes[_.indexOf(infoHashes, bi.hash)] = nbi.hash;
+    infoHashesInt[nbi.hash] = bigint.fromBuffer(nbi.hash);
+    delete infoHashesInt[bi.hash];
+    
+    log(util.format('%s removed %d/%d o: %d', bi.hash.toString('hex').slice(0, 5), bi.datapoints.length, bi.datapointEstimate, bi.outstanding));
+    log(util.format('%s added %d/%d to: %d', nbi.hash.toString('hex').slice(0, 5), nbi.datapoints.length, nbi.datapointEstimate, nbi.totalOutstanding));
+
+    bi.inDHT = false;
+    bi.totalOutstanding += bi.outstanding;
+    bi.outstanding = 0;
+
+    nbi.inDHT = true;
+  }
+
   //private
+  var status_lines = 0;
+  var displayStatus = function(){    
+    readline.moveCursor(process.stdout, 0, -status_lines);
+    readline.clearScreenDown(process.stdout);
+    
+    console.log('\nStatus:')
+    for(var i = 0; i < infoHashes.length; i++){
+      var bi = backlog[infoHashes[i]];
+
+      var completion = (bi.datapoints.length / bi.datapointEstimate * 100).toFixed(2);
+
+
+      console.log('%s %d% (%d)', bi.hash.toString('hex').slice(0,5), completion, bi.datapoints.length);
+    }
+    var foundValues = _.reduce(_.pluck(backlog, 'datapoints'), function(sum, datapoints) {
+      return sum + datapoints.length;
+    }, 0);
+
+    var estimatedValues = _.reduce(_.pluck(backlog, 'datapointEstimate'), function(sum, num) {
+      return sum + num;
+    });
+
+    console.log('values: %d - estimation: %d', foundValues, estimatedValues);
+    status_lines = infoHashes.length + 3;
+  };
+
+  var log = function(line){
+    readline.moveCursor(process.stdout, 0, -status_lines);
+    readline.clearScreenDown(process.stdout);
+    console.log(line);
+    status_lines = 0;
+    displayStatus();
+  }
+
+  setInterval(displayStatus,200);
+
   var addNode = function(id, ip, port){
-    if(!dht[id])
-      dht[id] = {
+    //var profileStart = new Date().getTime();
+    if(!dht[id]){
+      var node = {
         id: id,
+        idInt: bigint.fromBuffer(id),
         ip: ip,
         port: port,
         queried: {},
-        failures: 0
+        failures: 0,
+        distances: {},
+
       };
+
+      dht[id] = node;
+      dhtArray.push(node);
+    }
+    //var profileDuration = new Date().getTime() - profileStart;
+    //var timePerNode = (profileDuration / dhtArray.length).toFixed(2);
+    //console.error('Profile: addNode %d ms %d ms/n %d (dht size)', profileDuration, timePerNode, dhtArray.length);
   };
 
-  var getClosest = function(infoHash, maxNum){
-    console.error('DHT size:', _.values(dht).length);
-    console.error('DHT usable:', _(dht).values().reject(function(node){return node.failures>=3;}).value().length);
-    return _(dht)
-      .values()
-      //.each(function(node){console.log(node);})
-      .reject(function(node){ return node.queried[infoHash];})
-      .reject(function(node){ return node.failures >= 3;})
-      .map(function(node){
-        return {
-          node: node,
-          distance: bigint.fromBuffer(xor(node.id, infoHash))
-        };
-      })
-      .sort(function(a, b) {
-        if (a.distance.lt(b.distance)) return -1;
-        if (a.distance.gt(b.distance)) return 1;
-        return 0;
-      })
-      //.each(function(node){console.log(node);})
-      .slice(0, maxNum)
-      .pluck('node')
-      .value();
+  var addPrivateNode = function(bi, id, ip, port){
+    if(!bi.dht[id]){
+      var fullnode = {
+        id: id,
+        idInt: bigint.fromBuffer(id),
+        ip: ip,
+        port: port,
+        queried: false,
+        failures: 0
+      };
+      fullnode.distance = fullnode.idInt.xor(bigint.fromBuffer(bi.hash));
+
+      bi.dht[id] = fullnode;
+      bi.dhtArray.push(fullnode);    
+    }
+  }
+
+  var getClosest2 = function(infoHash){
+    var profileStart = new Date().getTime();
+
+    var closestNode = undefined;
+    var closestDistance = 0;
+    var distanceCalculations = 0;
+    var bi = backlog[infoHash];
+  
+    for(var i = 0; i < bi.dhtArray.length; i++){
+      var node = bi.dhtArray[i];
+      
+      if(node.queried[infoHash]) continue;
+      if(node.failures >= 3) continue;
+
+      var distance = node.distance;
+      
+      if(!closestNode || distance.lt(closestDistance)){
+        closestNode = node;
+        closestDistance = distance
+      }
+    }
+
+    var profileDuration = new Date().getTime() - profileStart;
+    var timePerNode = (profileDuration / bi.dhtArray.length).toFixed(2);
+    //console.error('Profile: getClosest2 %d ms %d ms/n %d (dht size) %d (distances calculated)', profileDuration, timePerNode, dhtArray.length, distanceCalculations);
+
+    if(!closestNode){
+      _(dhtArray)
+        .sample(16)
+        .each(function(node){
+          addPrivateNode(bi, node.id, node.ip, node.port);
+        });
+      return null;
+    }
+
+    return closestNode;
   };
 
   var buildFindNodeQuery = function(infoHash, tid){
@@ -128,13 +295,11 @@ function DHT(){
     node.failures++;
     client.send(buf, 0, buf.length, node.port, node.ip, function(err/*, bytes*/) {
       if (err) return deferred.reject(err);
-      querys[tid.readUInt32BE(0)] = {
+      querys[tid] = {
         deferred: deferred,
         infoHash: infoHash,
         node: node
       };
-      console.error('Query Buffer:', _.values(querys).length);
-      //console.error('UDP message sent to ' + node.ip +':'+ node.port);
     });
     return deferred.promise;
   };
@@ -142,91 +307,106 @@ function DHT(){
   var client = dgram.createSocket('udp4');
 
   client.on('message', function(messageBuffer, remote) {
-    console.error('Message from %s:%d', remote.address, remote.port);
-
     try{
       var message = bencode.decode(messageBuffer);
     }
     catch (e){
-      console.error('Response poorly formated');
+      log('Response poorly formated');
       return;
     }
 
     if(!message.t || message.t.length !== 4)
       return;
 
-    if(!querys[message.t.readUInt32BE(0)])
-      return console.error('Message took too long:', message.t.toString('hex'));
+    if(!querys[message.t])
+      return log(util.format('Message took too long:', message.t.toString('hex')));
 
     if(!message.r){
-      //querys[message.t.readUInt32BE(0)].reject(new Error('Query contained no response'));
-      if(message.e) console.error('Error', message.e[1].toString());
-      else console.error('Query contained no response');
+      if(message.e) log(util.format('Error %s', message.e[1].toString()));
+      else log('Query contained no response');
       return;
     }
-    //console.log(util.inspect(message));
-    var infoHash = querys[message.t.readUInt32BE(0)].infoHash.toString('hex');
 
     var values = message.r.values;
-    if(values){
-      _.each(values, function(peer){
+    if(values){    
+      var infoHash = querys[message.t].infoHash.toString('hex');
+      //var datapoints = 0;
+
+      var datapoints = [];
+      for(var i = 0; i < values.length; i++){
+        var peer = values[i];
         if(peer instanceof Buffer){
-          var ip = peer.readUInt32BE(0);
+          var ip = peer[0] + '.' + peer[1] + '.' + peer[2] + '.' + peer[3];
           var port = peer.readUInt16BE(4);
-          
-          console.log('%s,%s:%d', infoHash, num2dot(ip), port);
+          var id = util.format('%s,%s:%d', infoHash, ip, port);
+          datapoints.push(id);
+
+          //datapoints++;
         }
+      }
+      //outputStream.write(csvPeers);
+
+      querys[message.t].deferred.resolve({
+        datapoints: datapoints
       });
-      querys[message.t.readUInt32BE(0)].node.failures--;
-      querys[message.t.readUInt32BE(0)].deferred.resolve();
+      //delete querys[message.t.readUInt32BE(0)];
+      //return;
+    }
+
+    var nodesBuffer = message.r.nodes;
+    if(!nodesBuffer){
+      querys[message.t].deferred.reject(new Error('No nodes value'));
       //delete querys[message.t.readUInt32BE(0)];
       return;
     }
 
-    var nodes = message.r.nodes;
-    if(!nodes){
-      querys[message.t.readUInt32BE(0)].deferred.reject(new Error('No nodes value'));
-      //delete querys[message.t.readUInt32BE(0)];
-      return;
+    var nodes = [];
+    for(var i = 0; i < nodesBuffer.length; i += 26){
+      var node = {
+        id: nodesBuffer.slice(i, i+20),
+        ip: num2dot(nodesBuffer.readUInt32BE(i+20)),
+        port: nodesBuffer.readUInt16BE(i+24)
+      }
+      addNode(node.id, node.ip, node.port);
+      nodes.push(node);
     }
 
-    for(var i = 0; i < nodes.length; i += 26){
-      var id = nodes.slice(i, i+20);
-      var ip = nodes.readUInt32BE(i+20);
-      var port = nodes.readUInt16BE(i+24);
-      //console.error("%s:%d", num2dot(ip), port);
-      addNode(id, num2dot(ip), port);
-    }
-
-    querys[message.t.readUInt32BE(0)].node.failures--;
-    querys[message.t.readUInt32BE(0)].deferred.resolve();
-    //delete querys[message.t.readUInt32BE(0)];
+    querys[message.t].node.failures--;
+    querys[message.t].deferred.resolve({nodes: nodes});
+    //delete querys[message.t];
   });
 }
 
-/*var hashes = [
-  new Buffer( '4B642D022980E5EBAA7CF4B6E1CC93769921CB42', 'hex'),
-  new Buffer('65548EDADF2AD10F73DB8DFA002A80EFD2A1AB45', 'hex'),
-  new Buffer('CE9FBDAA734CFBC160E8EF9D29072646C09958DD', 'hex'),
-  new Buffer('4956A4E976EA948025C3C3554567CA2820F65F64', 'hex'),
-  new Buffer('AAD050EE1BB22E196939547B134535824DABF0CE', 'hex'),
-  new Buffer('803F725EED41FA46FD229D4A3DB47CC32B7B6BDE', 'hex'),
-  new Buffer('80B0F2788FD33CBB6272049EDFE3911F6AEAE5AC', 'hex'),
-  new Buffer('10AB9CAD41F545893AF00993CBFA168FABD46395', 'hex'),
-  new Buffer('3535A1A6375A619507141C7975611740455E1954', 'hex'),
-];*/
+var argv = yargs.argv;
 
-var jsonFile = fs.readFileSync(process.argv[2]);
+var jsonFile = fs.readFileSync(argv._[0]);
 var movieInfo = JSON.parse(jsonFile);
+movieInfo = _.filter(movieInfo);
 
-var hashes = _.map(_.pluck(movieInfo, 'hash'), function(hex){ return new Buffer(hex, 'hex')});
-
-var dht = new DHT();
-dht.bootstrap(HOST, PORT).done(function(){
-  _.each(hashes, function(info_hash){
-    dht.findPeers(info_hash);
-  });
+var hashes = _.map(movieInfo, function(movie){ 
+  return {
+    hash: new Buffer(movie.hash, 'hex'),
+    datapointEstimate: parseInt(movie.seeds) + parseInt(movie.leechers)
+  }   
 });
+
+var dht = new DHT(argv.o);
+
+function bootstrap(){
+  dht.bootstrap(HOST, PORT).done(function(){
+    console.log('DHT Bootstrapped');
+    dht.addHashes(hashes);
+    _.each(_.range(0, 96), function(){
+      dht.findPeers2();
+    });
+  },
+  function(){
+    console.log('DHT Bootstrap failed');
+    bootstrap();
+  });
+};
+
+bootstrap();
 
 function num2dot(num){
   var d = num%256;
